@@ -5,19 +5,20 @@ colorFrom: purple
 colorTo: pink
 sdk: gradio
 sdk_version: 6.28.0
-python_version: "3.12"
+python_version: '3.12'
 app_file: app.py
 short_description: Uncensored Qwen 2.1 with All-In-One LoRAs
 startup_duration_timeout: 1h
 models:
-  - KasugaiSakura/Qwen-Image-2.1-Uncensored-Abenzerps-GGUF
-  - Qwen/Qwen-Image-2.1
-  - WarmBloodAban/Qwen-Image-2.1-LoRAs
-  - prithivMLmods/Qwen-Image-2.1-Natural-Exposure-LoRA
-  - alibaba-pai/Qwen-Image-2.1-Fun-Acc-LoRAs
-  - Viggle/Qwen-Image-2.1-viggle-turbo
-  - Alissonerdx/BFS-Best-Face-Swap
-  - lilylilith/AnyPose
+- KasugaiSakura/Qwen-Image-2.1-Uncensored-Abenzerps-GGUF
+- Qwen/Qwen-Image-2.1
+- WarmBloodAban/Qwen-Image-2.1-LoRAs
+- prithivMLmods/Qwen-Image-2.1-Natural-Exposure-LoRA
+- alibaba-pai/Qwen-Image-2.1-Fun-Acc-LoRAs
+- Viggle/Qwen-Image-2.1-viggle-turbo
+- Alissonerdx/BFS-Best-Face-Swap
+- lilylilith/AnyPose
+pinned: true
 ---
 
 # 🚀 Qwen-Image-2.1 Uncensored All-In-One LoRA Studio
