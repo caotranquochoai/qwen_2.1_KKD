@@ -26,7 +26,7 @@ pinned: true
 An all-in-one generative AI suite running [KasugaiSakura/Qwen-Image-2.1-Uncensored-Abenzerps-GGUF](https://huggingface.co/KasugaiSakura/Qwen-Image-2.1-Uncensored-Abenzerps-GGUF) on a local NVIDIA GPU or Hugging Face Spaces, equipped with on-demand **All-In-One LoRA Adapters**.
 
 ## ✨ Features
-- **Uncensored GGUF Base**: Quantized weights stay packed; individual layers compute in BF16 using `qwen-image-2.1-UC-Q4_K_M.gguf`.
+- **Uncensored GGUF Base**: Automatically select BF16 or Q4_K_M from available GPU memory. Quantized weights stay packed and compute per layer in BF16.
 - **All-In-One LoRA Suite**:
   - ⚡ **Turbo Acceleration**: 4-step / 5-step fast inference with Viggle Turbo & Pai Fun-Acc.
   - 🎨 **Aesthetic & Style LoRAs**: Anime Consistency, Natural Exposure Photorealism, Hyperrealistic & Ultrarealistic Portraits, Flat-Log Film Grade.
@@ -39,6 +39,9 @@ An all-in-one generative AI suite running [KasugaiSakura/Qwen-Image-2.1-Uncensor
 
 ## Local memory usage
 
+The transformer now defaults to automatic selection as described below; this
+section's Q4 memory measurements apply when Q4_K_M is selected.
+
 Local runs default to `QWEN_MEMORY_MODE=low_vram`: the quantized transformer and VAE stay on CUDA, while the text encoder loads its layers from system RAM when needed. VAE tiling reduces decode memory. The Q4_K_M transformer stores approximately 4.29 GiB of weights, compared with 13.25 GiB when expanded to BF16. CUDA also needs memory for LoRAs, activations, and workspaces; the file size alone is not the total VRAM requirement.
 
 The text encoder still requires substantial system RAM. CPU offloading stores these weights in ordinary RAM; it should not require Windows to spill a fully resident GPU model into shared GPU memory. Transfers make prompt encoding slower than keeping the entire encoder on a larger GPU.
@@ -48,6 +51,67 @@ Run from an activated environment containing CUDA-enabled PyTorch and the projec
 ```powershell
 python app.py
 ```
+
+## Automatic checkpoint selection
+
+The UI now opens **before model weights are loaded**. Open **Chọn và load
+model**, select `auto` or a GGUF filename, then click **Load model**. Changing
+the dropdown alone does not load anything. **Ngừng dùng / Unload model**
+releases the active pipeline, its LoRAs, diagnostic references and unused
+CUDA cache. Downloaded checkpoint files remain in the Hugging Face disk cache.
+
+When changing checkpoints, the app unloads the old pipeline before loading
+the new one; it does not keep both in VRAM. A shared lock makes load/unload
+wait for active generation. If loading fails, no model remains active and
+the UI reports the failure so you can select another checkpoint. Model
+switching does not require restarting the app. The API loads its configured
+default on its first image request and keeps it warm for subsequent requests.
+
+The app detects the current CUDA GPU before downloading weights. With
+`QWEN_MODEL_PROFILE=auto` (default), GPUs with at least 22 GiB total VRAM and
+18 GiB free VRAM select `qwen-image-2.1-UC-BF16.gguf` in `low_vram` mode.
+This includes an RTX 3090 24 GB when sufficient VRAM is free. Other GPUs,
+including the RTX 5060 Ti, 5070 Ti and 5080 16 GB, select Q4_K_M. These are
+capacity-based starting choices, not a guarantee of the fastest checkpoint.
+
+In full `cuda` mode, automatic BF16 selection requires at least 37 GiB free,
+because the BF16 text encoder also stays on the GPU. Otherwise auto chooses
+Q4_K_M; full CUDA still needs enough memory for that pipeline. Local runs
+continue to default to `low_vram`, including on the 3090.
+
+The UI, startup log, diagnostics, PNG metadata and API `/v1/qwen/config`
+show the actual selected checkpoint and reason. If automatic BF16 selection
+runs out of CUDA memory while loading, the app releases the partial model
+and retries once with Q4_K_M. This does not handle CPU RAM exhaustion or
+guarantee that every later combination of LoRAs/references fits. An inference
+OOM does not silently switch checkpoints or retry the generation.
+
+The first BF16 run downloads approximately 14.23 GB unless already cached.
+The transformer is moved to CUDA before loading the text encoder to reduce
+temporary competition for system RAM.
+
+To override the selection, set `QWEN_MODEL_PROFILE` to `bf16`, `q4_k_m`,
+`q5_k_m`, `q6_k`, `q8_0` or `q4_0` before starting the process. An explicit
+`QWEN_GGUF_CHECKPOINT` filename takes precedence over this profile and disables
+automatic fallback. Clear an old filename override to use auto:
+
+```powershell
+Remove-Item Env:QWEN_GGUF_CHECKPOINT -ErrorAction SilentlyContinue
+$env:QWEN_MODEL_PROFILE = "auto"  # or "q5_k_m" to compare quality
+python app.py
+```
+
+On Linux:
+
+```bash
+unset QWEN_GGUF_CHECKPOINT
+QWEN_MODEL_PROFILE=auto python app.py
+```
+
+FP8, INT8 ConvRot, NVFP4 and MLX safetensors are not supported by this loader
+and are not automatically selected. Environment settings determine the initial
+dropdown/default API checkpoint; a deliberate UI selection overrides that
+initial choice. Loading a settings JSON does not reload the model.
 
 ## GPU diagnostics
 

@@ -117,6 +117,13 @@ def create_api(backend=None, *, api_key=None):
                 "Transform & Swap (2 Refs)" if len(images) == 2 else
                 "Edit Image (1 Ref)" if images else
                 "Transparent PNG" if options.background == "transparent" else "Text to Image")
+        # Hold the shared backend lock across loading and generation so UI model
+        # switches cannot unload the pipeline between these operations.
+        with source._MODEL_LOCK:
+            source.ensure_model_loaded()
+            return generate_output(source, options, images, aspect, adapter, mode, is_outfit)
+
+    def generate_output(source, options, images, aspect, adapter, mode, is_outfit):
         path, _, seed, details = source.generate(
             prompt=options.prompt, mode=mode,
             ref_image_1=images[0] if images else None,
@@ -192,6 +199,8 @@ def create_api(backend=None, *, api_key=None):
         return {"model": MODEL_NAME, "sizes": [f"{w}x{h}" for w, h in source.SIZES.values()],
                 "loras": source.LORA_CHOICES, "steps": {"min": 4, "max": 40}, "n": 1,
                 "max_reference_images": MAX_GARMENT_IMAGES + 1,
+                "model_selection": source.MODEL_SELECTION,
+                "model_loaded": source.pipe is not None, "model_status": source.MODEL_STATUS,
                 "edit_modes": ["auto", "outfit"]}
 
     @server.post("/v1/images/generations", dependencies=[Depends(authorize)])

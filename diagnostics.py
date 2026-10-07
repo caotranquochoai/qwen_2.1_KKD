@@ -45,9 +45,10 @@ def _environment(memory_mode):
 
 
 class InferenceDiagnostics:
-    def __init__(self, pipeline, memory_mode):
+    def __init__(self, pipeline, memory_mode, model_selection=None):
         self.pipe = pipeline
         self.environment = _environment(memory_mode)
+        self.environment["model_selection"] = model_selection
         self.phases = {}
         self.step_seconds = []
         self.samples = []
@@ -226,6 +227,9 @@ class InferenceDiagnostics:
                  f"Torch: {env['torch']} | CUDA: {env['cuda']} | Diffusers: {env['diffusers']}",
                  f"Memory mode: {env['memory_mode']} | Yêu cầu kernel GGUF: {env['gguf_cuda_kernels_requested']}",
                  f"Trạng thái: {self.stage}"]
+        if env.get("model_selection"):
+            lines.append(f"Checkpoint: {env['model_selection']['checkpoint']}")
+            lines.append(f"Chọn model: {env['model_selection']['reason']}")
         with self._lock:
             sample = dict(self._snapshot)
         for label, keys in (
@@ -266,3 +270,10 @@ def latest_diagnostics():
     with _latest_lock:
         current = _latest
     return current.text() if current else "Chạy một lượt tạo ảnh để xem môi trường, thời gian và telemetry GPU tại đây."
+
+
+def clear_diagnostics():
+    """Drop retained profiler references so an unloaded pipeline can be collected."""
+    global _latest
+    with _latest_lock:
+        _latest = None

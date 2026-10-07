@@ -1,4 +1,7 @@
 import os
+import gc
+import functools
+import threading
 import hashlib
 import json
 import random
@@ -19,7 +22,8 @@ from huggingface_hub import hf_hub_download
 from PIL import Image, ImageOps, PngImagePlugin
 from safetensors.torch import load_file as safetensors_load_file
 from model_loading import load_quantized_transformer
-from diagnostics import InferenceDiagnostics, latest_diagnostics
+from model_selection import CHECKPOINTS, detect_and_choose, selection_text
+from diagnostics import InferenceDiagnostics, clear_diagnostics, latest_diagnostics
 from workflow_support import (
     MAX_GARMENT_IMAGES, MULTI_OUTFIT_MODE, OUTFIT_PROMPT, SETTING_FIELDS,
     clothing_prompt, load_settings, save_settings,
@@ -27,7 +31,6 @@ from workflow_support import (
 
 # Model Configuration
 MODEL_ID = "KasugaiSakura/Qwen-Image-2.1-Uncensored-Abenzerps-GGUF"
-CHECKPOINT = os.environ.get("QWEN_GGUF_CHECKPOINT", "qwen-image-2.1-UC-Q4_K_M.gguf")
 COMPANION_ID = "Qwen/Qwen-Image-2.1"
 COMPANION_REVISION = "790c92633540aa0cb11d9abf19eb46d861714758"
 MEMORY_MODE = os.environ.get(
@@ -35,6 +38,11 @@ MEMORY_MODE = os.environ.get(
 ).lower()
 if MEMORY_MODE not in {"cuda", "low_vram"}:
     raise ValueError("QWEN_MEMORY_MODE must be 'cuda' or 'low_vram'.")
+MODEL_SELECTION = detect_and_choose(
+    MEMORY_MODE, os.environ.get("QWEN_GGUF_CHECKPOINT", ""),
+    os.environ.get("QWEN_MODEL_PROFILE", "auto"),
+)
+CHECKPOINT = MODEL_SELECTION["checkpoint"]
 
 SHA256_CHECKSUMS = {
     # Uncensored (UC) GGUFs
@@ -222,48 +230,127 @@ LOADED_ADAPTERS = set()
 # ============================================================
 # GGUF Checkpoint Initialization on CUDA
 # ============================================================
-print(f"Loading checkpoint {CHECKPOINT} from {MODEL_ID}...", flush=True)
-checkpoint_path = hf_hub_download(MODEL_ID, CHECKPOINT)
-
-if CHECKPOINT in SHA256_CHECKSUMS:
-    with open(checkpoint_path, "rb") as f:
-        checksum = hashlib.file_digest(f, "sha256").hexdigest()
-    if checksum != SHA256_CHECKSUMS[CHECKPOINT]:
-        raise RuntimeError(f"Checksum verification failed for {CHECKPOINT}! Got {checksum}")
-    print(f"Checksum verified: {checksum}", flush=True)
-
-config = QwenImage21Transformer2DModel.load_config(
-    COMPANION_ID, subfolder="transformer", revision=COMPANION_REVISION
-)
-transformer = load_quantized_transformer(checkpoint_path, config)
-transformer_gib = sum(p.numel() * p.element_size() for p in transformer.parameters()) / 2**30
-print(f"Loaded GGUF transformer: {transformer_gib:.2f} GiB of packed weights.", flush=True)
-
-# Load companion components on CPU first; avoid a full-pipeline CUDA transfer
-# in the local 16 GB profile.
-pipe = QwenImage21Pipeline.from_pretrained(
-    COMPANION_ID,
-    revision=COMPANION_REVISION,
-    transformer=transformer,
-    torch_dtype=torch.bfloat16,
-)
-if MEMORY_MODE == "low_vram":
-    pipe.transformer.to("cuda")
-    pipe.vae.to("cuda")
-    pipe.vae.enable_tiling()
-    # Group hooks preserve normal CPU parameters (no meta tensors) and are
-    # reapplied by Diffusers when loading LoRAs. Do not sequentially offload
-    # GGUF weights with Accelerate: it can lose their quantization metadata.
-    apply_group_offloading(
-        pipe.text_encoder,
-        onload_device=torch.device("cuda"),
-        offload_device=torch.device("cpu"),
-        offload_type="leaf_level",
-        use_stream=False,
+def initialize_pipeline(checkpoint):
+    print(f"Loading checkpoint {checkpoint} from {MODEL_ID}...", flush=True)
+    checkpoint_path = hf_hub_download(MODEL_ID, checkpoint)
+    if checkpoint in SHA256_CHECKSUMS:
+        with open(checkpoint_path, "rb") as file:
+            checksum = hashlib.file_digest(file, "sha256").hexdigest()
+        if checksum != SHA256_CHECKSUMS[checkpoint]:
+            raise RuntimeError(f"Checksum verification failed for {checkpoint}! Got {checksum}")
+        print(f"Checksum verified: {checksum}", flush=True)
+    config = QwenImage21Transformer2DModel.load_config(
+        COMPANION_ID, subfolder="transformer", revision=COMPANION_REVISION
     )
-else:
-    pipe.to("cuda")
-print(f"{MODEL_ID} initialized with memory profile '{MEMORY_MODE}'.", flush=True)
+    transformer = load_quantized_transformer(checkpoint_path, config)
+    transformer_gib = sum(p.numel() * p.element_size() for p in transformer.parameters()) / 2**30
+    print(f"Loaded transformer: {transformer_gib:.2f} GiB of weights.", flush=True)
+    # Move transformer first so BF16 weights do not compete with the encoder in RAM.
+    transformer.to("cuda")
+    pipeline = QwenImage21Pipeline.from_pretrained(
+        COMPANION_ID, revision=COMPANION_REVISION,
+        transformer=transformer, torch_dtype=torch.bfloat16,
+    )
+    if MEMORY_MODE == "low_vram":
+        pipeline.vae.to("cuda")
+        pipeline.vae.enable_tiling()
+        apply_group_offloading(
+            pipeline.text_encoder,
+            onload_device=torch.device("cuda"), offload_device=torch.device("cpu"),
+            offload_type="leaf_level", use_stream=False,
+        )
+    else:
+        pipeline.to("cuda")
+    return pipeline
+
+
+# Opening the UI/API does not download or instantiate model weights.
+pipe = None
+MODEL_STATUS = "Chưa load model. Chọn checkpoint rồi bấm Load model."
+_MODEL_LOCK = threading.RLock()
+
+
+def serialized_model_operation(function):
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        with _MODEL_LOCK:
+            return function(*args, **kwargs)
+    return wrapped
+
+
+def model_status_text():
+    return MODEL_STATUS + "\n\n" + selection_text(MODEL_SELECTION)
+
+
+@serialized_model_operation
+def unload_model():
+    global pipe, MODEL_STATUS
+    MODEL_STATUS = "Đang giải phóng model và LoRA…"
+    clear_diagnostics()
+    pipe = None
+    LOADED_ADAPTERS.clear()
+    gc.collect()
+    torch.cuda.empty_cache()
+    MODEL_STATUS = "Đã ngừng dùng model và giải phóng bộ nhớ. File đã tải vẫn được giữ trong cache."
+    return model_status_text(), latest_diagnostics()
+
+
+@serialized_model_operation
+def load_selected_model(choice):
+    global pipe, CHECKPOINT, MODEL_SELECTION, MODEL_STATUS
+    allowed = {"auto", *CHECKPOINTS.values()}
+    # Preserve a custom GGUF filename supplied explicitly in the environment.
+    configured = os.environ.get("QWEN_GGUF_CHECKPOINT", "").strip()
+    if configured and configured.lower() != "auto":
+        allowed.add(configured)
+    if choice not in allowed:
+        raise gr.Error("Checkpoint không có trong danh sách được hỗ trợ.")
+    if pipe is not None and (choice == CHECKPOINT or (choice == "auto" and MODEL_SELECTION["automatic"])):
+        return model_status_text(), latest_diagnostics()
+    unload_model()
+    # Measure free VRAM after unloading, not while the old pipeline is resident.
+    MODEL_SELECTION = detect_and_choose(MEMORY_MODE, "" if choice == "auto" else choice)
+    CHECKPOINT = MODEL_SELECTION["checkpoint"]
+    while True:
+        MODEL_STATUS = f"Đang tải / load {CHECKPOINT}. Lần đầu có thể cần tải file model lớn…"
+        print(selection_text(MODEL_SELECTION), flush=True)
+        fallback = False
+        failed = None
+        try:
+            pipe = initialize_pipeline(CHECKPOINT)
+        except torch.cuda.OutOfMemoryError:
+            if MODEL_SELECTION["automatic"] and MODEL_SELECTION["profile"] == "bf16":
+                fallback = True
+            else:
+                failed = "Không đủ VRAM để load checkpoint này. Chọn Q4_K_M hoặc giải phóng GPU rồi thử lại."
+        except Exception as exc:
+            failed = f"Không thể load model: {exc}"
+        # Exceptions leave scope before cleanup, releasing partial model references.
+        if failed or fallback:
+            gc.collect()
+            torch.cuda.empty_cache()
+        if failed:
+            MODEL_STATUS = failed + " Model cũ đã được ngừng dùng; hiện chưa có model hoạt động."
+            raise gr.Error(failed)
+        if not fallback:
+            break
+        CHECKPOINT = CHECKPOINTS["q4_k_m"]
+        MODEL_SELECTION.update(profile="q4_k_m", checkpoint=CHECKPOINT,
+                               reason="BF16 thiếu VRAM khi khởi tạo; đã tự chuyển về Q4_K_M.")
+    MODEL_STATUS = f"Model đang hoạt động: {CHECKPOINT}. Chỉ một pipeline được giữ trong bộ nhớ."
+    print(MODEL_STATUS, flush=True)
+    return model_status_text(), latest_diagnostics()
+
+
+@serialized_model_operation
+def ensure_model_loaded():
+    """API clients load the configured default lazily on their first request."""
+    if pipe is None:
+        configured = os.environ.get("QWEN_GGUF_CHECKPOINT", "").strip()
+        profile = os.environ.get("QWEN_MODEL_PROFILE", "auto").strip().lower()
+        choice = (configured if configured and configured.lower() != "auto" else
+                  CHECKPOINTS[profile] if profile != "auto" else "auto")
+        load_selected_model(choice)
 
 
 # ============================================================
@@ -381,6 +468,7 @@ def ensure_adapter_ready(selected_lora: str, custom_repo: str = "", custom_file:
 # Inference Function
 # ============================================================
 @spaces.GPU(duration=60)
+@serialized_model_operation
 def generate(
     prompt: str,
     mode: str = "Text to Image",
@@ -397,6 +485,8 @@ def generate(
     garment_images: list | None = None,
     progress: gr.Progress = gr.Progress(track_tqdm=True),
 ) -> tuple[str, str, int, str]:
+    if pipe is None:
+        raise gr.Error("Chưa có model hoạt động. Chọn checkpoint rồi bấm Load model trước khi tạo ảnh.")
     prompt = (prompt or "").strip()
     if not prompt:
         raise gr.Error("Please enter a prompt describing your image.")
@@ -475,7 +565,7 @@ def generate(
             image.thumbnail((1024, 1024))
         call_kwargs["image"] = prepared
 
-    with InferenceDiagnostics(pipe, MEMORY_MODE) as diagnostics, torch.inference_mode():
+    with InferenceDiagnostics(pipe, MEMORY_MODE, MODEL_SELECTION) as diagnostics, torch.inference_mode():
         result = pipe(
             prompt=effective_prompt,
             width=width,
@@ -493,6 +583,7 @@ def generate(
     metadata = {
         "model": MODEL_ID,
         "checkpoint": CHECKPOINT,
+        "model_selection": MODEL_SELECTION,
         "lora_adapter": active_lora_desc,
         "prompt": prompt,
         "mode": mode,
@@ -600,6 +691,19 @@ with gr.Blocks(title="Qwen Image 2.1 Uncensored All-In-One LoRA Studio", delete_
         "### Supercharged Text-to-Image, Image Editing & Guided Synthesis powered by ZeroGPU\n"
         "Uncensored Base (`KasugaiSakura/Qwen-Image-2.1-Uncensored-Abenzerps-GGUF`) + 15+ On-Demand Style, Speed, and Face/Pose LoRAs"
     )
+    with gr.Accordion("🧠 Chọn và load model", open=True):
+        model_choices = ["auto"] + list(CHECKPOINTS.values())
+        if CHECKPOINT not in model_choices:
+            model_choices.append(CHECKPOINT)
+        model_selector = gr.Dropdown(
+            choices=model_choices, value="auto" if MODEL_SELECTION["automatic"] else CHECKPOINT,
+            label="Checkpoint (auto = đề xuất theo GPU)",
+        )
+        gr.Markdown("Chọn model rồi bấm Load. Khi đổi model, model cũ và LoRA được giải phóng trước. Việc đổi model chờ lượt tạo ảnh đang chạy kết thúc.")
+        with gr.Row():
+            load_model_btn = gr.Button("Load model", variant="primary")
+            unload_model_btn = gr.Button("Ngừng dùng / Unload model")
+        model_status_box = gr.Textbox(label="Trạng thái model", value=model_status_text(), lines=4, interactive=False)
 
     with gr.Row():
         with gr.Column(scale=6):
@@ -725,7 +829,18 @@ with gr.Blocks(title="Qwen Image 2.1 Uncensored All-In-One LoRA Studio", delete_
                 diagnostics_timer = gr.Timer(value=2)
 
     # Event Bindings
-    diagnostics_timer.tick(fn=latest_diagnostics, outputs=[diagnostics_box], queue=False, api_name=False)
+    diagnostics_timer.tick(
+        fn=lambda: (latest_diagnostics(), model_status_text()),
+        outputs=[diagnostics_box, model_status_box], queue=False, api_name=False,
+    )
+    load_model_btn.click(
+        fn=load_selected_model, inputs=[model_selector], outputs=[model_status_box, diagnostics_box],
+        concurrency_limit=1, concurrency_id="qwen-aio-pipeline", api_name=False,
+    )
+    unload_model_btn.click(
+        fn=unload_model, outputs=[model_status_box, diagnostics_box],
+        concurrency_limit=1, concurrency_id="qwen-aio-pipeline", api_name=False,
+    )
     mode_selector.change(
         fn=update_mode_ui,
         inputs=[mode_selector],
@@ -761,7 +876,6 @@ with gr.Blocks(title="Qwen Image 2.1 Uncensored All-In-One LoRA Studio", delete_
         concurrency_limit=1,
         concurrency_id="qwen-aio-pipeline",
     )
-
     garment_upload.change(fn=preview_garments, inputs=[garment_upload], outputs=[garment_preview], api_name=False)
     outfit_prompt_btn.click(fn=lambda: OUTFIT_PROMPT, outputs=[prompt_input], api_name=False)
     settings_components = [

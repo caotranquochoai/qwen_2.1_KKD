@@ -15,7 +15,10 @@ python -m pip install -r requirements-api.txt
 python api_server.py
 ```
 
-Model loading happens before the server becomes ready. The default address is
+The server becomes ready without loading model weights. The first image request
+loads the configured checkpoint; subsequent requests reuse it. Allow extra
+client timeout for the first request if a large checkpoint must be downloaded.
+The default address is
 `http://127.0.0.1:8000`; interactive API documentation is at `/docs`.
 This command starts the API only. The original Gradio UI remains available
 through `python app.py`, but running both processes loads two model copies.
@@ -35,6 +38,12 @@ python api_server.py
 If `QWEN_API_KEY` is set, all API routes (including image downloads) require
 `Authorization: Bearer your-own-secret`. Without it, authentication is disabled.
 `QWEN_MEMORY_MODE` and `QWEN_GGUF_CHECKPOINT` retain their existing meanings.
+`QWEN_MODEL_PROFILE=auto` selects BF16 on a 24 GB GPU with enough free memory,
+or Q4_K_M on a 16 GB GPU. Explicit checkpoint filenames take precedence.
+See the README for exact thresholds and manual profiles; the API and UI use
+the same selection policy. `/v1/qwen/config` reports `model_selection`.
+It also reports `model_loaded` and `model_status`. The default checkpoint
+is loaded lazily on the first generation/edit request.
 
 ## Supported endpoints
 
