@@ -1,9 +1,12 @@
 """Inference phase timings and background GPU telemetry for the UI and API."""
 
+import csv
+import io
 import os
 import subprocess
 import threading
 import time
+import uuid
 
 import torch
 
@@ -19,6 +22,12 @@ _latest_lock = threading.Lock()
 def _sync():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def _normalized_uuid(value):
+    if isinstance(value, bytes) and len(value) == 16:
+        value = uuid.UUID(bytes=value)
+    return str(value or "").lower().removeprefix("gpu-").replace("-", "")
 
 
 def _environment(memory_mode):
@@ -52,24 +61,50 @@ class InferenceDiagnostics:
         self._last_step = None
         self._snapshot = {}
         props = torch.cuda.get_device_properties(self.environment["device"])
-        # UUID avoids sampling a different physical GPU under CUDA_VISIBLE_DEVICES.
-        self._gpu_id = str(getattr(props, "uuid", "") or
-                           os.getenv("CUDA_VISIBLE_DEVICES", "0").split(",")[0])
+        self._gpu_uuid = _normalized_uuid(getattr(props, "uuid", ""))
+
+    def _select_gpu(self, rows):
+        if self._gpu_uuid:
+            matches = [row for row in rows if _normalized_uuid(row[1]) == self._gpu_uuid]
+            if len(matches) == 1:
+                return matches[0]
+        if len(rows) == 1 and rows[0][2] == self.environment["gpu"]:
+            return rows[0]
+        # Logical CUDA indices can differ from nvidia-smi physical indices.
+        visible = os.getenv("CUDA_VISIBLE_DEVICES", "").split(",")
+        device = self.environment["device"]
+        physical = visible[device].strip() if device < len(visible) and visible[device].strip() else str(device)
+        matches = [row for row in rows if row[2] == self.environment["gpu"] and
+                   (row[0] == physical or _normalized_uuid(row[1]) == _normalized_uuid(physical))]
+        if len(matches) == 1:
+            return matches[0]
+        matches = [row for row in rows if row[2] == self.environment["gpu"]]
+        if len(matches) == 1:
+            return matches[0]
+        raise RuntimeError("Không xác định được GPU đang chạy trong danh sách nvidia-smi.")
 
     def _sample(self):
-        query = "utilization.gpu,utilization.memory,memory.used,power.draw,power.limit,clocks.sm,clocks.mem,temperature.gpu,pstate,driver_version"
+        query = "index,uuid,name,utilization.gpu,utilization.memory,memory.used,power.draw,power.limit,clocks.sm,clocks.mem,temperature.gpu,pstate,driver_version"
         try:
             completed = subprocess.run(
-                ["nvidia-smi", f"--id={self._gpu_id}", f"--query-gpu={query}",
+                ["nvidia-smi", f"--query-gpu={query}",
                  "--format=csv,noheader,nounits"], capture_output=True, text=True,
                 timeout=2, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if completed.returncode:
-                raise RuntimeError("nvidia-smi không đọc được GPU này")
-            fields = [part.strip() for part in completed.stdout.strip().splitlines()[0].split(",")]
+                message = (completed.stderr or completed.stdout).strip()[:300]
+                raise RuntimeError(f"nvidia-smi lỗi {completed.returncode}: {message}")
+            rows = [[part.strip() for part in row]
+                    for row in csv.reader(io.StringIO(completed.stdout)) if row]
+            if not rows:
+                raise RuntimeError("nvidia-smi không trả dữ liệu GPU.")
+            if any(len(row) != 13 for row in rows):
+                raise RuntimeError("nvidia-smi trả số cột không đúng định dạng.")
+            selected = self._select_gpu(rows)
+            fields = selected[3:]
             keys = ("gpu_pct", "memory_busy_pct", "vram_mib", "power_w", "power_limit_w",
                     "sm_mhz", "memory_mhz", "temperature_c", "pstate", "driver")
-            sample = {}
+            sample = {"physical_gpu_index": selected[0], "gpu_uuid": selected[1]}
             for key, value in zip(keys, fields):
                 if key in {"driver", "pstate"}:
                     sample[key] = value
@@ -78,6 +113,7 @@ class InferenceDiagnostics:
                     sample[key] = float(value)
                 except ValueError:
                     sample[key] = value
+            self.telemetry_error = None
         except (OSError, subprocess.SubprocessError, RuntimeError, IndexError) as exc:
             sample = {}
             self.telemetry_error = str(exc)
