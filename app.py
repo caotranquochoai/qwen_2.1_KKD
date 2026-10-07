@@ -13,19 +13,27 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import spaces
 import gradio as gr
 import torch
-from accelerate import init_empty_weights
 from diffusers import QwenImage21Pipeline, QwenImage21Transformer2DModel
-from diffusers.models.model_loading_utils import load_gguf_checkpoint
-from diffusers.quantizers.gguf.utils import dequantize_gguf_tensor
+from diffusers.hooks import apply_group_offloading
 from huggingface_hub import hf_hub_download
 from PIL import Image, ImageOps, PngImagePlugin
 from safetensors.torch import load_file as safetensors_load_file
+from model_loading import load_quantized_transformer
+from workflow_support import (
+    MAX_GARMENT_IMAGES, MULTI_OUTFIT_MODE, OUTFIT_PROMPT, SETTING_FIELDS,
+    clothing_prompt, load_settings, save_settings,
+)
 
 # Model Configuration
 MODEL_ID = "KasugaiSakura/Qwen-Image-2.1-Uncensored-Abenzerps-GGUF"
 CHECKPOINT = os.environ.get("QWEN_GGUF_CHECKPOINT", "qwen-image-2.1-UC-Q4_K_M.gguf")
 COMPANION_ID = "Qwen/Qwen-Image-2.1"
 COMPANION_REVISION = "790c92633540aa0cb11d9abf19eb46d861714758"
+MEMORY_MODE = os.environ.get(
+    "QWEN_MEMORY_MODE", "cuda" if os.environ.get("SPACE_ID") else "low_vram"
+).lower()
+if MEMORY_MODE not in {"cuda", "low_vram"}:
+    raise ValueError("QWEN_MEMORY_MODE must be 'cuda' or 'low_vram'.")
 
 SHA256_CHECKSUMS = {
     # Uncensored (UC) GGUFs
@@ -38,6 +46,7 @@ SHA256_CHECKSUMS = {
 }
 
 MODES = ["Text to Image", "Edit Image (1 Ref)", "Transform & Swap (2 Refs)", "Transparent PNG"]
+MODES.append(MULTI_OUTFIT_MODE)
 SIZES = {
     "Square · 1:1 (1024x1024)": (1024, 1024),
     "Landscape · 16:9 (1344x768)": (1344, 768),
@@ -222,30 +231,38 @@ if CHECKPOINT in SHA256_CHECKSUMS:
         raise RuntimeError(f"Checksum verification failed for {CHECKPOINT}! Got {checksum}")
     print(f"Checksum verified: {checksum}", flush=True)
 
-# Expand the GGUF weights to bfloat16 once at startup for ZeroGPU eager packing
-weights = load_gguf_checkpoint(checkpoint_path)
-for name in list(weights.keys()):
-    weights[name] = dequantize_gguf_tensor(weights[name]).to(torch.bfloat16)
-
 config = QwenImage21Transformer2DModel.load_config(
     COMPANION_ID, subfolder="transformer", revision=COMPANION_REVISION
 )
-with init_empty_weights():
-    transformer = QwenImage21Transformer2DModel.from_config(config)
+transformer = load_quantized_transformer(checkpoint_path, config)
+transformer_gib = sum(p.numel() * p.element_size() for p in transformer.parameters()) / 2**30
+print(f"Loaded GGUF transformer: {transformer_gib:.2f} GiB of packed weights.", flush=True)
 
-transformer.load_state_dict(weights, strict=True, assign=True)
-transformer.eval().requires_grad_(False)
-print(f"Loaded {len(weights)} tensors into QwenImage21Transformer2DModel.", flush=True)
-del weights
-
-# Load full pipeline with companion VAE and text encoder, eagerly placed on 'cuda'
+# Load companion components on CPU first; avoid a full-pipeline CUDA transfer
+# in the local 16 GB profile.
 pipe = QwenImage21Pipeline.from_pretrained(
     COMPANION_ID,
     revision=COMPANION_REVISION,
     transformer=transformer,
     torch_dtype=torch.bfloat16,
-).to("cuda")
-print(f"{MODEL_ID} successfully initialized on CUDA for ZeroGPU.", flush=True)
+)
+if MEMORY_MODE == "low_vram":
+    pipe.transformer.to("cuda")
+    pipe.vae.to("cuda")
+    pipe.vae.enable_tiling()
+    # Group hooks preserve normal CPU parameters (no meta tensors) and are
+    # reapplied by Diffusers when loading LoRAs. Do not sequentially offload
+    # GGUF weights with Accelerate: it can lose their quantization metadata.
+    apply_group_offloading(
+        pipe.text_encoder,
+        onload_device=torch.device("cuda"),
+        offload_device=torch.device("cpu"),
+        offload_type="leaf_level",
+        use_stream=False,
+    )
+else:
+    pipe.to("cuda")
+print(f"{MODEL_ID} initialized with memory profile '{MEMORY_MODE}'.", flush=True)
 
 
 # ============================================================
@@ -325,9 +342,9 @@ def _load_lora_with_fallback(repo: str, weight_name: str, adapter_name: str, nee
         pipe.load_lora_weights(sd, adapter_name=adapter_name)
 
 
-def ensure_adapter_ready(selected_lora: str, custom_repo: str = "", custom_file: str = "") -> tuple[str, float]:
+def ensure_adapter_ready(selected_lora: str, custom_repo: str = "", custom_file: str = "") -> str:
     if selected_lora == NONE_LORA:
-        return "", 1.0
+        return ""
 
     if selected_lora == "Custom HuggingFace LoRA...":
         custom_repo = (custom_repo or "").strip()
@@ -339,11 +356,11 @@ def ensure_adapter_ready(selected_lora: str, custom_repo: str = "", custom_file:
             print(f"Loading custom LoRA from {custom_repo} / {custom_file}...", flush=True)
             _load_lora_with_fallback(custom_repo, custom_file, adapter_name, needs_alpha_fix=True)
             LOADED_ADAPTERS.add(adapter_name)
-        return adapter_name, 1.0
+        return adapter_name
 
     spec = ADAPTER_SPECS.get(selected_lora)
     if not spec:
-        return "", 1.0
+        return ""
 
     adapter_name = spec["adapter_name"]
     if adapter_name not in LOADED_ADAPTERS:
@@ -356,7 +373,7 @@ def ensure_adapter_ready(selected_lora: str, custom_repo: str = "", custom_file:
         )
         LOADED_ADAPTERS.add(adapter_name)
 
-    return adapter_name, float(spec.get("default_strength", 1.0))
+    return adapter_name
 
 
 # ============================================================
@@ -376,6 +393,7 @@ def generate(
     steps: int = 30,
     seed: int = 42,
     randomize_seed: bool = True,
+    garment_images: list | None = None,
     progress: gr.Progress = gr.Progress(track_tqdm=True),
 ) -> tuple[str, str, int, str]:
     prompt = (prompt or "").strip()
@@ -396,13 +414,25 @@ def generate(
         if ref_image_1 is None or ref_image_2 is None:
             raise gr.Error("Please upload both Image 1 (Base) and Image 2 (Donor/Pose) for this mode.")
 
+    if mode == MULTI_OUTFIT_MODE:
+        if ref_image_1 is None:
+            raise gr.Error("Vui lòng tải ảnh người mẫu vào Image 1.")
+        if not garment_images or not 1 <= len(garment_images) <= MAX_GARMENT_IMAGES:
+            raise gr.Error(f"Vui lòng tải từ 1 đến {MAX_GARMENT_IMAGES} ảnh của cùng một trang phục.")
+
     actual_seed = random.randint(0, MAX_SEED) if randomize_seed else int(seed)
+    if not 0 <= actual_seed <= MAX_SEED:
+        raise gr.Error(f"Seed must be between 0 and {MAX_SEED}.")
+    if not 0.0 <= float(lora_strength) <= 1.5:
+        raise gr.Error("LoRA strength must be between 0 and 1.5.")
     width, height = SIZES[aspect_ratio]
 
     # Prepare LoRA
-    active_adapter, base_strength = ensure_adapter_ready(lora_adapter, custom_repo, custom_file)
+    active_adapter = ensure_adapter_ready(lora_adapter, custom_repo, custom_file)
     if active_adapter:
-        effective_strength = float(lora_strength) * base_strength
+        # The UI already sets the adapter's recommended strength when selected.
+        # Multiplying by the recommendation again would apply it twice.
+        effective_strength = float(lora_strength)
         pipe.set_adapters([active_adapter], adapter_weights=[effective_strength])
         active_lora_desc = f"{lora_adapter} (scale={round(effective_strength, 2)})"
     else:
@@ -410,6 +440,8 @@ def generate(
         active_lora_desc = "None"
 
     effective_prompt = prompt
+    if mode == MULTI_OUTFIT_MODE:
+        effective_prompt = clothing_prompt(prompt, len(garment_images))
     if mode == "Transparent PNG":
         effective_prompt = (
             "This is an RGBA image with transparency. " + prompt
@@ -428,6 +460,19 @@ def generate(
         img2 = ImageOps.exif_transpose(ref_image_2).convert("RGBA")
         img2.thumbnail((2048, 2048))
         call_kwargs["image"] = [img1, img2]
+    elif mode == MULTI_OUTFIT_MODE:
+        prepared = [ImageOps.exif_transpose(ref_image_1).convert("RGBA")]
+        for reference in garment_images:
+            if isinstance(reference, Image.Image):
+                image = ImageOps.exif_transpose(reference).convert("RGBA")
+            else:
+                with Image.open(reference) as opened:
+                    image = ImageOps.exif_transpose(opened).convert("RGBA")
+            prepared.append(image)
+        for image in prepared:
+            # Bound reference token count for the local 16 GB memory profile.
+            image.thumbnail((1024, 1024))
+        call_kwargs["image"] = prepared
 
     start_time = time.perf_counter()
     with torch.inference_mode():
@@ -452,6 +497,10 @@ def generate(
         "steps": int(steps),
         "dimensions": f"{result.width}x{result.height}",
         "elapsed_seconds": round(elapsed, 2),
+        "reference_count": (
+            len(call_kwargs["image"]) if isinstance(call_kwargs.get("image"), list)
+            else (1 if "image" in call_kwargs else 0)
+        ),
     }
     png_info = PngImagePlugin.PngInfo()
     png_info.add_text("parameters", json.dumps(metadata, ensure_ascii=False))
@@ -463,7 +512,7 @@ def generate(
     details = (
         f"⚡ Time: {elapsed:.2f}s | Seed: {actual_seed} | Steps: {steps}\n"
         f"🎛️ LoRA: {active_lora_desc} | Size: {result.width}x{result.height}\n"
-        f"🔒 Privacy: Zero data retention (session ephemeral)"
+        "🔒 Files are temporarily processed and stored by the Space for download."
     )
 
     return out_png_path, out_png_path, actual_seed, details
@@ -494,9 +543,37 @@ def update_lora_selection(selected_lora: str, current_prompt: str, current_steps
 def update_mode_ui(mode: str):
     is_edit_1 = mode == "Edit Image (1 Ref)"
     is_swap_2 = mode == "Transform & Swap (2 Refs)"
+    is_outfit = mode == MULTI_OUTFIT_MODE
     return (
-        gr.update(visible=(is_edit_1 or is_swap_2)),
+        gr.update(visible=(is_edit_1 or is_swap_2 or is_outfit)),
         gr.update(visible=is_swap_2),
+        gr.update(visible=is_outfit),
+    )
+
+
+def preview_garments(paths):
+    if paths and len(paths) > MAX_GARMENT_IMAGES:
+        raise gr.Error(f"Tối đa {MAX_GARMENT_IMAGES} ảnh trang phục.")
+    return [(path, f"Image {index + 2}") for index, path in enumerate(paths or [])]
+
+
+def export_ui_settings(*values):
+    try:
+        return save_settings(values, MODES, LORA_CHOICES, SIZES), "Đã lưu thiết lập. Tải file JSON để dùng lại."
+    except (ValueError, OSError) as exc:
+        raise gr.Error(str(exc)) from exc
+
+
+def import_ui_settings(path):
+    try:
+        values = load_settings(path, MODES, LORA_CHOICES, SIZES)
+    except (ValueError, OSError, TypeError) as exc:
+        raise gr.Error(f"Không thể load cấu hình: {exc}") from exc
+    return (
+        *(values[name] for name in SETTING_FIELDS),
+        *update_mode_ui(values["mode"]),
+        gr.update(visible=values["lora_adapter"] == "Custom HuggingFace LoRA..."),
+        "Đã load thiết lập. Ảnh tham chiếu không được lưu trong JSON; hãy kiểm tra/tải lại ảnh.",
     )
 
 
@@ -546,6 +623,19 @@ with gr.Blocks(title="Qwen Image 2.1 Uncensored All-In-One LoRA Studio", delete_
                     visible=False,
                 )
 
+            with gr.Column(visible=False) as garment_box:
+                gr.Markdown(
+                    "**Ảnh trang phục:** tải 1–9 ảnh của cùng mẫu đồ, cùng màu. "
+                    "Ảnh đầu là Image 2 (màu/thiết kế chính), các ảnh sau là góc khác hoặc cận cảnh. "
+                    "Nên bắt đầu với 2–4 ảnh trang phục trên GPU 16 GB."
+                )
+                garment_upload = gr.File(
+                    label="Các góc trang phục (theo thứ tự Image 2, 3, …)",
+                    file_count="multiple", file_types=["image"], type="filepath",
+                )
+                garment_preview = gr.Gallery(label="Thứ tự ảnh tham chiếu", columns=3, interactive=False)
+                outfit_prompt_btn = gr.Button("Dùng prompt thay trang phục mẫu")
+
             with gr.Accordion("🎨 All-In-One LoRA Adapters", open=True):
                 lora_dropdown = gr.Dropdown(
                     choices=LORA_CHOICES,
@@ -563,10 +653,12 @@ with gr.Blocks(title="Qwen Image 2.1 Uncensored All-In-One LoRA Studio", delete_
 
                 with gr.Row(visible=False) as custom_lora_box:
                     custom_repo_input = gr.Textbox(
+                        value="",
                         label="Hugging Face LoRA Repo",
                         placeholder="e.g. prithivMLmods/Qwen-Image-2.1-Natural-Exposure-LoRA",
                     )
                     custom_file_input = gr.Textbox(
+                        value="",
                         label="LoRA Weights Filename",
                         placeholder="e.g. Qwen-Image-2.1-Natural-Exposure-LoRA-4000.safetensors",
                     )
@@ -589,6 +681,14 @@ with gr.Blocks(title="Qwen Image 2.1 Uncensored All-In-One LoRA Studio", delete_
                 with gr.Row():
                     seed_number = gr.Number(value=42, label="Seed", precision=0)
                     randomize_seed_cb = gr.Checkbox(value=True, label="Randomize Seed")
+
+            with gr.Accordion("💾 Lưu / Load thiết lập", open=False):
+                gr.Markdown("Lưu prompt, chế độ, LoRA, kích thước, steps và seed vào JSON. Ảnh tham chiếu cần tải lại riêng.")
+                with gr.Row():
+                    save_settings_btn = gr.Button("Lưu thiết lập")
+                    load_settings_btn = gr.UploadButton("Load thiết lập JSON", file_types=[".json"], type="filepath")
+                settings_download = gr.File(label="Tải cấu hình đã lưu", interactive=False)
+                settings_status = gr.Textbox(label="Trạng thái cấu hình", interactive=False)
 
             generate_btn = gr.Button(
                 "✨ Generate Image",
@@ -616,10 +716,11 @@ with gr.Blocks(title="Qwen Image 2.1 Uncensored All-In-One LoRA Studio", delete_
     mode_selector.change(
         fn=update_mode_ui,
         inputs=[mode_selector],
-        outputs=[ref_img_1, ref_img_2],
+        outputs=[ref_img_1, ref_img_2, garment_box],
     )
 
-    lora_dropdown.change(
+    # Only user selections apply presets; loading settings must restore exact values.
+    lora_dropdown.input(
         fn=update_lora_selection,
         inputs=[lora_dropdown, prompt_input, steps_slider],
         outputs=[prompt_input, steps_slider, lora_strength_slider, custom_lora_box],
@@ -640,11 +741,29 @@ with gr.Blocks(title="Qwen Image 2.1 Uncensored All-In-One LoRA Studio", delete_
             steps_slider,
             seed_number,
             randomize_seed_cb,
+            garment_upload,
         ],
         outputs=[output_image, download_file, seed_number, details_box],
         api_name="generate",
         concurrency_limit=1,
         concurrency_id="qwen-aio-pipeline",
+    )
+
+    garment_upload.change(fn=preview_garments, inputs=[garment_upload], outputs=[garment_preview], api_name=False)
+    outfit_prompt_btn.click(fn=lambda: OUTFIT_PROMPT, outputs=[prompt_input], api_name=False)
+    settings_components = [
+        prompt_input, mode_selector, lora_dropdown, lora_strength_slider,
+        custom_repo_input, custom_file_input, aspect_ratio_dropdown,
+        steps_slider, seed_number, randomize_seed_cb,
+    ]
+    save_settings_btn.click(
+        fn=export_ui_settings, inputs=settings_components,
+        outputs=[settings_download, settings_status], api_name=False,
+    )
+    load_settings_btn.upload(
+        fn=import_ui_settings, inputs=[load_settings_btn],
+        outputs=settings_components + [ref_img_1, ref_img_2, garment_box, custom_lora_box, settings_status],
+        api_name=False,
     )
 
     gr.Examples(

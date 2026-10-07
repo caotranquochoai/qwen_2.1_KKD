@@ -23,10 +23,10 @@ pinned: true
 
 # 🚀 Qwen-Image-2.1 Uncensored All-In-One LoRA Studio
 
-An all-in-one generative AI suite running [KasugaiSakura/Qwen-Image-2.1-Uncensored-Abenzerps-GGUF](https://huggingface.co/KasugaiSakura/Qwen-Image-2.1-Uncensored-Abenzerps-GGUF) on Hugging Face ZeroGPU (`zero-a10g`), equipped with on-demand **All-In-One LoRA Adapters**.
+An all-in-one generative AI suite running [KasugaiSakura/Qwen-Image-2.1-Uncensored-Abenzerps-GGUF](https://huggingface.co/KasugaiSakura/Qwen-Image-2.1-Uncensored-Abenzerps-GGUF) on a local NVIDIA GPU or Hugging Face Spaces, equipped with on-demand **All-In-One LoRA Adapters**.
 
 ## ✨ Features
-- **Uncensored GGUF Base**: Native fast BF16-packed inference powered by `qwen-image-2.1-UC-Q4_K_M.gguf`.
+- **Uncensored GGUF Base**: Quantized weights stay packed; individual layers compute in BF16 using `qwen-image-2.1-UC-Q4_K_M.gguf`.
 - **All-In-One LoRA Suite**:
   - ⚡ **Turbo Acceleration**: 4-step / 5-step fast inference with Viggle Turbo & Pai Fun-Acc.
   - 🎨 **Aesthetic & Style LoRAs**: Anime Consistency, Natural Exposure Photorealism, Hyperrealistic & Ultrarealistic Portraits, Flat-Log Film Grade.
@@ -34,5 +34,46 @@ An all-in-one generative AI suite running [KasugaiSakura/Qwen-Image-2.1-Uncensor
   - 💡 **Relighting & Atmosphere**: Directional studio lighting, light removal, and scene relighting.
   - 🔍 **Detail & Upscaling**: Semi-realistic detailer, skin retouching, and 2K resolution enhancement.
   - 🌐 **Custom Hugging Face LoRA**: Dynamically test ANY community LoRA simply by pasting its Hugging Face repository and filename!
-- **Privacy-First**: Zero server-side logging or storage. Ephemeral session generation.
+- **Temporary Processing**: Inputs and generated files are processed on the Space and temporarily stored so results can be returned and downloaded. Do not upload sensitive images.
 - **Full PNG Metadata**: Prompts, seeds, and active LoRAs are embedded into the downloaded image's chunks.
+
+## Local memory usage
+
+Local runs default to `QWEN_MEMORY_MODE=low_vram`: the quantized transformer and VAE stay on CUDA, while the text encoder loads its layers from system RAM when needed. VAE tiling reduces decode memory. The Q4_K_M transformer stores approximately 4.29 GiB of weights, compared with 13.25 GiB when expanded to BF16. CUDA also needs memory for LoRAs, activations, and workspaces; the file size alone is not the total VRAM requirement.
+
+The text encoder still requires substantial system RAM. CPU offloading stores these weights in ordinary RAM; it should not require Windows to spill a fully resident GPU model into shared GPU memory. Transfers make prompt encoding slower than keeping the entire encoder on a larger GPU.
+
+Run from an activated environment containing CUDA-enabled PyTorch and the project dependencies:
+
+```powershell
+python app.py
+```
+
+## Multi-view clothing and saved settings
+
+Select **Thay trang phục — nhiều góc** to use Image 1 as the person and upload
+1–9 garment images in the order Image 2, 3, and so on. Use different views or
+detail crops of the same garment and color; put the main color/front view
+first. The preview shows the reference order. Remove and re-upload files to
+change their order. Click **Dùng prompt thay trang phục mẫu** for a starting
+prompt, then customize the requested edit. Select **None** for the LoRA when
+trying this workflow initially.
+
+References in this mode fit within 1024×1024. Start with 2–4 garment images
+on a 16 GB GPU; more references increase memory use and processing time.
+
+Open **Lưu / Load thiết lập**, click **Lưu thiết lập**, and download the JSON.
+Use **Load thiết lập JSON** to restore the prompt, mode, LoRA, strength,
+custom LoRA source, aspect ratio, steps, seed and seed randomization. Uploaded
+reference images are not included in the settings file. Loading settings
+does not apply LoRA presets over the saved prompt/steps/strength.
+
+The separate OpenAI-compatible Images API also supports this workflow;
+see [API.md](API.md) for startup instructions and SDK examples.
+
+On Hugging Face Spaces, `QWEN_MEMORY_MODE` defaults to `cuda`, which puts the entire pipeline on the GPU while preserving GGUF quantization. To select either profile explicitly:
+
+```powershell
+$env:QWEN_MEMORY_MODE = "low_vram"  # or "cuda" for a GPU with enough memory
+python app.py
+```

@@ -3,3 +3,6 @@ __pycache__/
 .gradio/
 *.safetensors
 *.gguf
+env/
+json/
+lora_audit.json
