@@ -19,6 +19,7 @@ from huggingface_hub import hf_hub_download
 from PIL import Image, ImageOps, PngImagePlugin
 from safetensors.torch import load_file as safetensors_load_file
 from model_loading import load_quantized_transformer
+from diagnostics import InferenceDiagnostics, latest_diagnostics
 from workflow_support import (
     MAX_GARMENT_IMAGES, MULTI_OUTFIT_MODE, OUTFIT_PROMPT, SETTING_FIELDS,
     clothing_prompt, load_settings, save_settings,
@@ -474,17 +475,19 @@ def generate(
             image.thumbnail((1024, 1024))
         call_kwargs["image"] = prepared
 
-    start_time = time.perf_counter()
-    with torch.inference_mode():
+    with InferenceDiagnostics(pipe, MEMORY_MODE) as diagnostics, torch.inference_mode():
         result = pipe(
             prompt=effective_prompt,
             width=width,
             height=height,
             num_inference_steps=int(steps),
             generator=torch.Generator("cuda").manual_seed(actual_seed),
+            callback_on_step_end=diagnostics.on_step_end,
+            callback_on_step_end_tensor_inputs=[],
             **call_kwargs,
         ).images[0]
-    elapsed = time.perf_counter() - start_time
+    # Exclude sampler shutdown; keep Time as the completed pipeline duration.
+    elapsed = diagnostics.total_s
 
     # Embed metadata into PNG chunks
     metadata = {
@@ -497,6 +500,7 @@ def generate(
         "steps": int(steps),
         "dimensions": f"{result.width}x{result.height}",
         "elapsed_seconds": round(elapsed, 2),
+        "diagnostics": diagnostics.report(),
         "reference_count": (
             len(call_kwargs["image"]) if isinstance(call_kwargs.get("image"), list)
             else (1 if "image" in call_kwargs else 0)
@@ -513,6 +517,7 @@ def generate(
         f"⚡ Time: {elapsed:.2f}s | Seed: {actual_seed} | Steps: {steps}\n"
         f"🎛️ LoRA: {active_lora_desc} | Size: {result.width}x{result.height}\n"
         "🔒 Files are temporarily processed and stored by the Space for download."
+        + "\n\n" + diagnostics.text()
     )
 
     return out_png_path, out_png_path, actual_seed, details
@@ -711,8 +716,16 @@ with gr.Blocks(title="Qwen Image 2.1 Uncensored All-In-One LoRA Studio", delete_
                 label="Execution Details & Privacy",
                 interactive=False,
             )
+            with gr.Accordion("📊 Chẩn đoán GPU và tốc độ", open=True):
+                diagnostics_box = gr.Textbox(
+                    label="GPU đang chạy và thời gian từng giai đoạn",
+                    value=latest_diagnostics(), lines=12, max_lines=30, interactive=False,
+                )
+                gr.Markdown("Cập nhật khoảng 2 giây/lần. Telemetry lấy mẫu trong pipeline; đồng bộ CUDA để đo thời gian có thể thêm một ít chi phí.")
+                diagnostics_timer = gr.Timer(value=2)
 
     # Event Bindings
+    diagnostics_timer.tick(fn=latest_diagnostics, outputs=[diagnostics_box], queue=False, api_name=False)
     mode_selector.change(
         fn=update_mode_ui,
         inputs=[mode_selector],

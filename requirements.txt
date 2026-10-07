@@ -8,3 +8,4 @@ Pillow
 sentencepiece
 gguf==0.19.0
 mcp
+psutil

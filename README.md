@@ -49,6 +49,29 @@ Run from an activated environment containing CUDA-enabled PyTorch and the projec
 python app.py
 ```
 
+## GPU diagnostics
+
+The **Chẩn đoán GPU và tốc độ** panel refreshes approximately every two seconds
+during generation. A background `nvidia-smi` sampler reports GPU utilization,
+memory activity, VRAM usage, power/limit, SM and memory clocks, temperature,
+P-state and driver version. RAM usage is shown when `psutil` is installed.
+No terminal monitoring command is needed. Unsupported GPU counters show N/A;
+if `nvidia-smi` is unavailable, phase timings still work.
+
+Completed runs show prompt/image encoding, latent/reference VAE preparation,
+denoising, output VAE decoding, average seconds per step, first-step prefill,
+subsequent-step average, and peak PyTorch allocated/reserved VRAM. Environment
+information includes the GPU, PyTorch, CUDA build, Diffusers and memory profile.
+The GGUF kernel flag reflects the requested configuration, not confirmation
+that every operation used an optimized kernel.
+
+Diagnostics are also appended to generation details (including API responses)
+and embedded as structured metadata in the PNG. Timings synchronize CUDA to
+measure completed GPU work and can add some overhead. The displayed total
+excludes LoRA loading, PNG saving, and telemetry shutdown. GPU sampling begins
+with inference and may miss brief spikes. Compare warmed runs with matching
+prompts, modes, references, steps and seeds.
+
 ## Multi-view clothing and saved settings
 
 Select **Thay trang phục — nhiều góc** to use Image 1 as the person and upload
