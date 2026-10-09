@@ -158,7 +158,21 @@ does not apply LoRA presets over the saved prompt/steps/strength.
 The separate OpenAI-compatible Images API also supports this workflow;
 see [API.md](API.md) for startup instructions and SDK examples.
 
-On Hugging Face Spaces, `QWEN_MEMORY_MODE` defaults to `cuda`, which puts the entire pipeline on the GPU while preserving GGUF quantization. To select either profile explicitly:
+The **Chọn và load model** panel includes a **Tiết kiệm VRAM (low_vram)**
+checkbox. Check it to move the text encoder between RAM and GPU; uncheck it
+to keep the entire pipeline on the GPU, which requires more VRAM. Click
+**Load model** to apply the selected checkpoint and memory mode. Changing
+the checkbox alone does not affect the running model. Selecting the same
+checkpoint and mode reuses the loaded pipeline; changing either unloads
+the previous pipeline and LoRAs before loading again. These changes wait
+for active generation and apply to all clients of the same server process.
+The model status and diagnostics show the mode actually in use. Saved
+generation settings JSON does not include this checkbox.
+
+`QWEN_MEMORY_MODE` sets the initial checkbox value and the default for the
+separate API process. Local runs default to `low_vram`; Hugging Face Spaces
+default to `cuda`, which puts the entire pipeline on the GPU while preserving
+GGUF quantization. To select either initial profile explicitly:
 
 ```powershell
 $env:QWEN_MEMORY_MODE = "low_vram"  # or "cuda" for a GPU with enough memory

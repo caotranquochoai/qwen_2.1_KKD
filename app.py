@@ -296,8 +296,12 @@ def unload_model():
 
 
 @serialized_model_operation
-def load_selected_model(choice):
-    global pipe, CHECKPOINT, MODEL_SELECTION, MODEL_STATUS
+def load_selected_model(choice, low_vram=None):
+    global pipe, CHECKPOINT, MODEL_SELECTION, MODEL_STATUS, MEMORY_MODE
+    # API callers omit this argument and keep the configured/current mode.
+    if low_vram is not None and not isinstance(low_vram, bool):
+        raise gr.Error("Tùy chọn low_vram phải là ô chọn bật/tắt.")
+    requested_mode = MEMORY_MODE if low_vram is None else ("low_vram" if low_vram else "cuda")
     allowed = {"auto", *CHECKPOINTS.values()}
     # Preserve a custom GGUF filename supplied explicitly in the environment.
     configured = os.environ.get("QWEN_GGUF_CHECKPOINT", "").strip()
@@ -305,9 +309,11 @@ def load_selected_model(choice):
         allowed.add(configured)
     if choice not in allowed:
         raise gr.Error("Checkpoint không có trong danh sách được hỗ trợ.")
-    if pipe is not None and (choice == CHECKPOINT or (choice == "auto" and MODEL_SELECTION["automatic"])):
+    if (pipe is not None and requested_mode == MODEL_SELECTION["memory_mode"]
+            and (choice == CHECKPOINT or (choice == "auto" and MODEL_SELECTION["automatic"]))):
         return model_status_text(), latest_diagnostics()
     unload_model()
+    MEMORY_MODE = requested_mode
     # Measure free VRAM after unloading, not while the old pipeline is resident.
     MODEL_SELECTION = detect_and_choose(MEMORY_MODE, "" if choice == "auto" else choice)
     CHECKPOINT = MODEL_SELECTION["checkpoint"]
@@ -322,7 +328,7 @@ def load_selected_model(choice):
             if MODEL_SELECTION["automatic"] and MODEL_SELECTION["profile"] == "bf16":
                 fallback = True
             else:
-                failed = "Không đủ VRAM để load checkpoint này. Chọn Q4_K_M hoặc giải phóng GPU rồi thử lại."
+                failed = "Không đủ VRAM để load checkpoint này. Bật low_vram, chọn Q4_K_M hoặc giải phóng GPU rồi thử lại."
         except Exception as exc:
             failed = f"Không thể load model: {exc}"
         # Exceptions leave scope before cleanup, releasing partial model references.
@@ -699,7 +705,12 @@ with gr.Blocks(title="Qwen Image 2.1 Uncensored All-In-One LoRA Studio", delete_
             choices=model_choices, value="auto" if MODEL_SELECTION["automatic"] else CHECKPOINT,
             label="Checkpoint (auto = đề xuất theo GPU)",
         )
-        gr.Markdown("Chọn model rồi bấm Load. Khi đổi model, model cũ và LoRA được giải phóng trước. Việc đổi model chờ lượt tạo ảnh đang chạy kết thúc.")
+        low_vram_checkbox = gr.Checkbox(
+            value=MEMORY_MODE == "low_vram",
+            label="Tiết kiệm VRAM (low_vram)",
+            info="Bật: chuyển text encoder giữa RAM và GPU. Tắt: giữ toàn bộ pipeline trên GPU, cần nhiều VRAM hơn. Áp dụng khi bấm Load model.",
+        )
+        gr.Markdown("Chọn model và chế độ bộ nhớ rồi bấm Load. Khi đổi model hoặc chế độ, model cũ và LoRA được giải phóng trước; chờ lượt tạo ảnh đang chạy kết thúc. Model và chế độ đang hoạt động được dùng chung cho mọi người truy cập.")
         with gr.Row():
             load_model_btn = gr.Button("Load model", variant="primary")
             unload_model_btn = gr.Button("Ngừng dùng / Unload model")
@@ -834,7 +845,7 @@ with gr.Blocks(title="Qwen Image 2.1 Uncensored All-In-One LoRA Studio", delete_
         outputs=[diagnostics_box, model_status_box], queue=False, api_name=False,
     )
     load_model_btn.click(
-        fn=load_selected_model, inputs=[model_selector], outputs=[model_status_box, diagnostics_box],
+        fn=load_selected_model, inputs=[model_selector, low_vram_checkbox], outputs=[model_status_box, diagnostics_box],
         concurrency_limit=1, concurrency_id="qwen-aio-pipeline", api_name=False,
     )
     unload_model_btn.click(
