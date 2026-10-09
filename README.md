@@ -37,6 +37,47 @@ An all-in-one generative AI suite running [KasugaiSakura/Qwen-Image-2.1-Uncensor
 - **Temporary Processing**: Inputs and generated files are processed on the Space and temporarily stored so results can be returned and downloaded. Do not upload sensitive images.
 - **Full PNG Metadata**: Prompts, seeds, and active LoRAs are embedded into the downloaded image's chunks.
 
+## Windows installation
+
+Download or clone the complete repository, open PowerShell in its folder,
+then run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-windows.ps1
+```
+
+The script installs missing Python 3.12 x64 and Git through WinGet, creates
+or reuses `env`, installs PyTorch 2.14.0 CUDA 13.2 from the official PyTorch
+wheel index, and installs both project and UI/API dependencies. It stops on
+installation errors and checks CUDA availability without loading model
+weights. A working NVIDIA driver and internet access are required. Driver
+installation is manual. If WinGet is unavailable, install Python 3.12 x64
+and Git for Windows manually first. Close running UI/API processes before
+updating an existing environment. An incompatible `env` is preserved;
+rename it and rerun to create a new one.
+
+To install and start the UI immediately:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-windows.ps1 -Launch UI
+```
+
+Use `-Launch API` for the separate API server. Use `-PythonPath` with the
+full path to Python 3.12 when creating a new environment, or
+`-SkipPrerequisiteInstall` to require Python and Git to be installed already.
+The execution policy override applies only to this PowerShell process.
+After installation, start either server without activating the environment:
+
+```powershell
+.\env\Scripts\python.exe app.py
+# Or: .\env\Scripts\python.exe api_server.py
+```
+
+Choose the checkpoint and **Tiết kiệm VRAM (low_vram)** mode in the UI,
+then click **Load model**. Large model files download separately on first
+load. Run one of the UI or API processes at a time to avoid duplicate model
+copies in GPU memory.
+
 ## Local memory usage
 
 The transformer now defaults to automatic selection as described below; this
