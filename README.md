@@ -78,6 +78,48 @@ then click **Load model**. Large model files download separately on first
 load. Run one of the UI or API processes at a time to avoid duplicate model
 copies in GPU memory.
 
+## Linux installation
+
+Download/clone the complete repository and run from its folder:
+
+```bash
+bash install-linux.sh --launch ui
+```
+
+Use `bash install-linux.sh` to install only, or `--launch api` to start the
+API instead. The script creates/reuses `env`, installs the same PyTorch
+2.14.0 CUDA 13.2 build as Windows, and installs project/UI/API dependencies.
+It checks CUDA availability without loading model weights. Ubuntu 24.04
+x86_64 is the intended starting environment; missing Git, Python 3.12 and
+venv packages are installed through apt (with sudo when needed). On older
+Ubuntu/Debian versions where Python 3.12 is unavailable, or other Linux
+distributions, install Python 3.12 with venv and Git manually, then use:
+
+```bash
+bash install-linux.sh --python /path/to/python3.12 --skip-prerequisites
+```
+
+A working NVIDIA driver, internet access and Linux x86_64 are required.
+Driver installation is manual; GPU containers need NVIDIA GPU passthrough.
+Close any running UI/API before updating dependencies. An existing
+incompatible environment is preserved; rename it before rerunning. Model
+files download separately on first load. Start the installed app later with:
+
+```bash
+./env/bin/python app.py
+# Or: ./env/bin/python api_server.py
+```
+
+For a remote server, explicitly bind Gradio to its network interface:
+
+```bash
+GRADIO_SERVER_NAME=0.0.0.0 GRADIO_SERVER_PORT=7860 ./env/bin/python app.py
+```
+
+Access `http://SERVER_IP:7860` from the client after configuring network
+access. See API.md for API host/key configuration. The UI still offers the
+low_vram checkbox and loads weights only after clicking **Load model**.
+
 ## Local memory usage
 
 The transformer now defaults to automatic selection as described below; this
